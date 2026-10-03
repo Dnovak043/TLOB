@@ -1,16 +1,19 @@
 """
-Full TLOB experiment on AAPL LOBSTER data.
+Full TLOB experiment on AAPL LOBSTER data, without Hydra's command line.
 
     train      2025-03-03 .. 2025-03-27  (19 days)
     validation 2025-03-28, 2025-03-31    (2 days)
     test       2025-04-01 .. 2025-04-03  (3 days)
 
 This is TLOB's own 80/10/10 day split over data/AAPL/AAPL_2025-03-03_2025-04-03/ (24 days).
-Each horizon is a normal TLOB run (main.py with Hydra overrides) on its own GPU. The first
-horizon preprocesses the data (CPU, ~30-45 min, ~110 GB RAM); the others start once
-data/AAPL/{train,val,test}.npy exist and reuse them.
 
-Run from anywhere, with the Python environment that has TLOB's requirements installed:
+Hydra's command line (@hydra.main in main.py) crashes on Python 3.14 ("badly formed help
+string"), so this program does what main.py does without it: it builds TLOB's config from
+config/config.py with OmegaConf (the same config object Hydra would build) and calls TLOB's
+own LOBSTERDataBuilder and run()/run_wandb(). TLOB's code is not changed.
+
+Each horizon runs in its own process on its own GPU. The first horizon preprocesses the data
+(CPU, ~30-45 min, ~110 GB RAM); the others start once data/AAPL/{train,val,test}.npy exist.
 
     python scripts/run_aapl.py
 """
@@ -51,15 +54,70 @@ def fail(msg):
     sys.exit(1)
 
 
+# --------------------------------------------------------------------------------------------
+# one TLOB run (runs in its own process, started by main() below)
+# --------------------------------------------------------------------------------------------
+
+def tlob_run(horizon, preprocess):
+    """What main.py does for one run, with the config built directly instead of by Hydra."""
+    sys.path.insert(0, TLOB_DIR)
+    os.chdir(TLOB_DIR)                       # TLOB uses paths relative to its folder ("data/...")
+    import random
+    import numpy as np
+    import torch
+    from omegaconf import OmegaConf
+    import constants as cst
+    from config.config import Config, LOBSTER, TLOB
+    from preprocessing.lobster import LOBSTERDataBuilder
+    from run import run, run_wandb
+
+    # main.py: set_torch()
+    torch.set_default_dtype(torch.float32)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.autograd.set_detect_anomaly(False)
+    torch.set_float32_matmul_precision("high")
+
+    # the config Hydra would build for: +model=tlob +dataset=lobster plus these overrides
+    config = OmegaConf.structured(Config(model=TLOB(), dataset=LOBSTER()))
+    config.dataset.dates = [FIRST_DAY, LAST_DAY]
+    config.dataset.training_stocks = [STOCK]
+    config.dataset.testing_stocks = [STOCK]
+    config.experiment.horizon = horizon
+    config.experiment.is_wandb = WANDB
+    config.experiment.is_data_preprocessed = not preprocess
+
+    # main.py: hydra_app()
+    torch.manual_seed(config.experiment.seed)
+    np.random.seed(config.experiment.seed)
+    random.seed(config.experiment.seed)
+    print("Using device: ", cst.DEVICE, flush=True)
+    accelerator = "cpu" if cst.DEVICE == "cpu" else "gpu"
+    config.model.hyperparameters_fixed["hidden_dim"] = 46          # main.py's value for TLOB on LOBSTER
+    if not config.experiment.is_data_preprocessed:
+        LOBSTERDataBuilder(
+            stocks=config.dataset.training_stocks,
+            data_dir=cst.DATA_DIR,
+            date_trading_days=config.dataset.dates,
+            split_rates=cst.SPLIT_RATES,
+            sampling_type=config.dataset.sampling_type,
+            sampling_time=config.dataset.sampling_time,
+            sampling_quantity=config.dataset.sampling_quantity,
+        ).prepare_save_datasets()
+    if config.experiment.is_wandb:
+        run_wandb(config, accelerator)()
+    else:
+        run(config, accelerator)
+
+
+# --------------------------------------------------------------------------------------------
+# the experiment: checks, then one process per horizon
+# --------------------------------------------------------------------------------------------
+
 def check_environment():
-    if sys.version_info >= (3, 13):
-        fail(f"Python {sys.version.split()[0]} is too new: Hydra crashes on 3.14 ('badly formed help string') and "
-             f"TLOB's torch 2.5 supports up to 3.12. Create the environment with Python 3.11:\n"
-             f"  uv venv ~/tlob-env --python 3.11 && uv pip install -p ~/tlob-env -r {os.path.join(TLOB_DIR, 'requirements.txt')}\n"
-             f"then run: ~/tlob-env/bin/python {os.path.abspath(__file__)}")
     try:
         import torch
-        import lightning, hydra, einops, torch_ema, lion_pytorch  # noqa: F401
+        import lightning, omegaconf, einops, torch_ema, lion_pytorch, sklearn  # noqa: F401
     except ImportError as e:
         fail(f"{e}. Install TLOB's requirements into this Python:\n"
              f"  {sys.executable} -m pip install -r {os.path.join(TLOB_DIR, 'requirements.txt')}")
@@ -69,7 +127,7 @@ def check_environment():
         if "HfFolder" in str(e):
             fail(f"{e}. Fix:\n  {sys.executable} -m pip install 'transformers<4.47' 'huggingface_hub<1.0'")
         raise
-    say(f"python {sys.executable} | torch {torch.__version__} | GPUs visible: {torch.cuda.device_count()}")
+    say(f"python {sys.version.split()[0]} | torch {torch.__version__} | GPUs visible: {torch.cuda.device_count()}")
     if torch.cuda.device_count() < len(GPUS):
         fail(f"{len(GPUS)} GPUs needed ({GPUS}), {torch.cuda.device_count()} visible")
     if WANDB:
@@ -94,16 +152,11 @@ def check_data():
     say(f"data: {DATA} ({N_DAYS} days)")
 
 
-def start_run(horizon, gpu, preprocessed):
-    cmd = [sys.executable, "main.py", "+model=tlob", "+dataset=lobster", "hydra.job.chdir=False",
-           f"dataset.dates=[{FIRST_DAY},{LAST_DAY}]",
-           f"dataset.training_stocks=[{STOCK}]", f"dataset.testing_stocks=[{STOCK}]",
-           f"experiment.is_wandb={WANDB}", f"experiment.horizon={horizon}",
-           f"experiment.is_data_preprocessed={preprocessed}"]
+def start_run(horizon, gpu, preprocess):
     log_path = os.path.join(LOG_DIR, f"{STOCK}_h{horizon}.log")
-    log = open(log_path, "w")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))   # one GPU per run
-    proc = subprocess.Popen(cmd, cwd=TLOB_DIR, env=env, stdout=log, stderr=subprocess.STDOUT)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1")   # one GPU per run
+    proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--run", str(horizon), str(int(preprocess))],
+                            cwd=TLOB_DIR, env=env, stdout=open(log_path, "w"), stderr=subprocess.STDOUT)
     say(f"horizon {horizon} started on GPU {gpu} -> {log_path}")
     return proc, log_path
 
@@ -128,7 +181,7 @@ def main():
 
     # first horizon: TLOB preprocesses, then trains
     runs = {}
-    proc, log_path = start_run(HORIZONS[0], GPUS[0], preprocessed=False)
+    proc, log_path = start_run(HORIZONS[0], GPUS[0], preprocess=True)
     runs[HORIZONS[0]] = (proc, log_path)
     say("preprocessing (this takes a while) ...")
     while True:
@@ -144,7 +197,7 @@ def main():
 
     # other horizons reuse data/<STOCK>/{train,val,test}.npy
     for horizon, gpu in zip(HORIZONS[1:], GPUS[1:]):
-        runs[horizon] = start_run(horizon, gpu, preprocessed=True)
+        runs[horizon] = start_run(horizon, gpu, preprocess=False)
 
     failed = []
     for horizon, (proc, log_path) in runs.items():
@@ -164,4 +217,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--run":
+        tlob_run(int(sys.argv[2]), bool(int(sys.argv[3])))
+    else:
+        main()
