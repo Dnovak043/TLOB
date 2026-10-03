@@ -32,6 +32,7 @@ DEFAULT_SPEC = {
     "max_epochs": 10,              # TLOB's default
     "limit_train_batches": 1.0,    # fraction (<= 1) or number of training batches per epoch
     "deterministic": False,        # deterministic torch algorithms (for exact comparisons)
+    "precision": 32,               # 32 = TLOB's default; 64 = float64 everywhere (numerical checks)
     "checkpoint_dir": "data/checkpoints",   # TLOB's default (constants.DIR_SAVED_MODEL)
     "is_debug": False,
     "model": {},                   # overrides of model.hyperparameters_fixed, e.g. {"num_layers": 1}
@@ -98,6 +99,11 @@ def tlob_run(spec):
     torch.backends.cudnn.allow_tf32 = True
     torch.autograd.set_detect_anomaly(False)
     torch.set_float32_matmul_precision("high")
+    if spec["precision"] == 64:
+        cst.PRECISION = "64-true"            # Lightning: model and batches in float64
+        torch.set_default_dtype(torch.float64)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     if spec["deterministic"]:
         torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.benchmark = False

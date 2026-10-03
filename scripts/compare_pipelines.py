@@ -32,6 +32,7 @@ SEED = 1                          # TLOB's default seed, used by every run
 MAX_EPOCHS = 2                    # epochs per run (2 also checks the second epoch's shuffle and lr logic)
 LIMIT_TRAIN_BATCHES = 20000       # training batches per epoch (batch 128); 1.0 = full epoch
 DETERMINISTIC = True              # deterministic torch algorithms, so A and B can match exactly
+PRECISION = 32                    # 32 = TLOB's default; 64 = float64 (rounding differences between runs shrink ~1e9x)
 
 SINGLE_GPU = 0                    # GPU for runs A and B and the batch check
 DDP_GPUS = [0, 1, 2, 3, 4, 5, 6, 7]   # GPUs for run C (batch 128 must divide by their number)
@@ -104,7 +105,7 @@ def check_batches():
 def run_training(name, gpu_batches, gpus):
     spec = {"stock": STOCK, "first_day": FIRST_DAY, "last_day": LAST_DAY, "horizon": HORIZON, "seed": SEED,
             "wandb": False, "gpu_batches": gpu_batches, "max_epochs": MAX_EPOCHS,
-            "limit_train_batches": LIMIT_TRAIN_BATCHES, "deterministic": DETERMINISTIC,
+            "limit_train_batches": LIMIT_TRAIN_BATCHES, "deterministic": DETERMINISTIC, "precision": PRECISION,
             "checkpoint_dir": f"data/checkpoints_compare/{name}", "model": MODEL}
     shutil.rmtree(os.path.join(R.TLOB_DIR, spec["checkpoint_dir"]), ignore_errors=True)
     log_path = os.path.join(OUT, f"{name}.log")
@@ -163,7 +164,8 @@ def main():
             run_training(f"C_gpu_batches_{len(DDP_GPUS)}gpus", True, DDP_GPUS)]
 
     lines = [f"TLOB pipeline comparison: {STOCK} {FIRST_DAY}..{LAST_DAY}, horizon {HORIZON}, seed {SEED}, "
-             f"{MAX_EPOCHS} epochs x {LIMIT_TRAIN_BATCHES} training batches, deterministic={DETERMINISTIC}", "",
+             f"{MAX_EPOCHS} epochs x {LIMIT_TRAIN_BATCHES} training batches, deterministic={DETERMINISTIC}, "
+             f"precision={PRECISION}", "",
              f"Batch check (DataLoader vs GPUBatchLoader, same seed): {check['identical']}/{check['compared']} "
              f"batches byte-identical (shape {check['batch_shape']})", ""]
     for r in runs:
