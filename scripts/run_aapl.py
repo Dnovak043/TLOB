@@ -52,6 +52,11 @@ def fail(msg):
 
 
 def check_environment():
+    if sys.version_info >= (3, 13):
+        fail(f"Python {sys.version.split()[0]} is too new: Hydra crashes on 3.14 ('badly formed help string') and "
+             f"TLOB's torch 2.5 supports up to 3.12. Create the environment with Python 3.11:\n"
+             f"  uv venv ~/tlob-env --python 3.11 && uv pip install -p ~/tlob-env -r {os.path.join(TLOB_DIR, 'requirements.txt')}\n"
+             f"then run: ~/tlob-env/bin/python {os.path.abspath(__file__)}")
     try:
         import torch
         import lightning, hydra, einops, torch_ema, lion_pytorch  # noqa: F401
