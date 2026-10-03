@@ -82,6 +82,9 @@ class Experiment:
     max_epochs: int = 10
     dir_ckpt: str = "model.ckpt"
     optimizer: str = "Adam"
+    gpu_batches: bool = False          # LOBSTER: build batches on the GPU (GPUBatchLoader) instead of DataLoader
+    num_gpus: int = 0                  # GPUs for one run (DDP if > 1); 0 = Lightning's default ("auto")
+    limit_train_batches: float = 1.0   # Lightning limit_train_batches: fraction (float) or number of batches
     
 defaults = [Model, Experiment, Dataset]
 

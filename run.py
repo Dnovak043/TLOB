@@ -13,10 +13,30 @@ from models.engine import Engine
 from preprocessing.fi_2010 import fi_2010_load
 from preprocessing.lobster import lobster_load
 from preprocessing.btc import btc_load
-from preprocessing.dataset import Dataset, DataModule
+from preprocessing.dataset import Dataset, DataModule, GPUBatchLoader
+from lightning.pytorch.strategies import DDPStrategy
 import constants as cst
 from constants import DatasetType, SamplingType
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
+
+
+def parallel_trainer_args(config: Config, accelerator):
+    """Trainer arguments for num_gpus / limit_train_batches (TLOB's defaults when they are not set)."""
+    args = {}
+    num_gpus = config.experiment.num_gpus
+    if num_gpus > 0:
+        args["devices"] = num_gpus
+    if num_gpus > 1:
+        # the event-type embedding is detached in TLOB.forward and BiN can replace its scalars,
+        # so some parameters get no gradient; DDP has to allow that
+        args["strategy"] = DDPStrategy(find_unused_parameters=True)
+    limit = config.experiment.limit_train_batches
+    args["limit_train_batches"] = int(limit) if limit > 1 else float(limit)
+    return args
+
+
+def is_global_rank_zero():
+    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0))) == 0 and int(os.environ.get("NODE_RANK", 0)) == 0
 
 
 def run(config: Config, accelerator):
@@ -40,7 +60,8 @@ def run(config: Config, accelerator):
         num_sanity_val_steps=0,
         detect_anomaly=False,
         profiler=None,
-        check_val_every_n_epoch=1
+        check_val_every_n_epoch=1,
+        **parallel_trainer_args(config, accelerator)
     )
     train(config, trainer)
 
@@ -126,6 +147,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
         for i in range(len(testing_stocks)):
             path = cst.DATA_DIR + "/" + testing_stocks[i] + "/test.npy"
             test_input, test_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
+            if config.experiment.gpu_batches:
+                test_set = GPUBatchLoader(test_input, test_labels, seq_size, config.dataset.batch_size*4, shuffle=False, is_train=False)
+                test_loaders.append(test_set)
+                continue
             test_set = Dataset(test_input, test_labels, seq_size)
             test_dataloader = DataLoader(
                 dataset=test_set,
@@ -138,19 +163,26 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
             test_loaders.append(test_dataloader)
         
-        train_set = Dataset(train_input, train_labels, seq_size)
-        val_set = Dataset(val_input, val_labels, seq_size)
+        if config.experiment.gpu_batches:
+            train_set = GPUBatchLoader(train_input, train_labels, seq_size, config.dataset.batch_size, shuffle=True, is_train=True)
+            val_set = GPUBatchLoader(val_input, val_labels, seq_size, config.dataset.batch_size, shuffle=False, is_train=False)
+        else:
+            train_set = Dataset(train_input, train_labels, seq_size)
+            val_set = Dataset(val_input, val_labels, seq_size)
         if config.experiment.is_debug:
             train_set.length = 1000
             val_set.length = 1000
             test_set.length = 10000
-        data_module = DataModule(
-            train_set=train_set,
-            val_set=val_set,
-            batch_size=config.dataset.batch_size,
-            test_batch_size=config.dataset.batch_size*4,
-            num_workers=4
-        )
+        if config.experiment.gpu_batches:
+            data_module = None
+        else:
+            data_module = DataModule(
+                train_set=train_set,
+                val_set=val_set,
+                batch_size=config.dataset.batch_size,
+                test_batch_size=config.dataset.batch_size*4,
+                num_workers=4
+            )
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     
@@ -324,7 +356,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
     
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))   
-    train_dataloader, val_dataloader = data_module.train_dataloader(), data_module.val_dataloader()
+    if data_module is None:     # GPUBatchLoader (experiment.gpu_batches)
+        train_dataloader, val_dataloader = train_set, val_set
+    else:
+        train_dataloader, val_dataloader = data_module.train_dataloader(), data_module.val_dataloader()
     
     if "TRAINING" in experiment_type or "FINETUNING" in experiment_type:
         trainer.fit(model, train_dataloader, val_dataloader)
@@ -370,7 +405,9 @@ def run_wandb(config: Config, accelerator):
                 else:
                     run_name += str(param[:2]) + "_" + str(value.value) + "_"
 
-        run = wandb.init(project=cst.PROJECT_NAME, name=run_name, entity="") # set entity to your wandb username
+        # set entity to your wandb username; with several GPUs only the first process logs
+        run = wandb.init(project=cst.PROJECT_NAME, name=run_name, entity="",
+                         mode=None if is_global_rank_zero() else "disabled")
         
         if config.experiment.is_sweep:
             model_params = run.config
@@ -406,6 +443,7 @@ def run_wandb(config: Config, accelerator):
             logger=wandb_logger,
             detect_anomaly=False,
             check_val_every_n_epoch=1,
+            **parallel_trainer_args(config, accelerator)
         )
 
         # log simulation details in WANDB console

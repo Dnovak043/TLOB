@@ -137,6 +137,9 @@ class Engine(LightningModule):
         
     def on_validation_epoch_end(self) -> None:
         self.val_loss = sum(self.val_losses) / len(self.val_losses)
+        # with several GPUs every process takes the first one's validation loss, so the learning
+        # rate, checkpointing and early stopping decisions stay identical on all of them
+        self.val_loss = float(self.trainer.strategy.broadcast(self.val_loss, src=0))
         self.val_losses = []
         
         # model checkpointing
@@ -182,7 +185,8 @@ class Engine(LightningModule):
         targets = np.concatenate(self.test_targets)    
         predictions = np.concatenate(self.test_predictions)
         predictions_path = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "predictions")
-        np.save(predictions_path, predictions)
+        if self.trainer.is_global_zero:     # every GPU tests the full test set; one writes the files
+            np.save(predictions_path, predictions)
         class_report = classification_report(targets, predictions, digits=4, output_dict=True)
         print(classification_report(targets, predictions, digits=4))
         self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
@@ -196,7 +200,8 @@ class Engine(LightningModule):
         self.first_test = False
         test_proba = np.concatenate(self.test_proba)
         precision, recall, _ = precision_recall_curve(targets, test_proba, pos_label=1)
-        self.plot_pr_curves(recall, precision, self.is_wandb) 
+        if self.trainer.is_global_zero:
+            self.plot_pr_curves(recall, precision, self.is_wandb)
         
     def configure_optimizers(self):
         if self.model_type == "DEEPLOB":
@@ -215,7 +220,7 @@ class Engine(LightningModule):
         wandb.define_metric("val_loss", summary="min")
 
     def model_checkpointing(self, loss):        
-        if self.last_path_ckpt is not None:
+        if self.last_path_ckpt is not None and self.trainer.is_global_zero:
             os.remove(self.last_path_ckpt)
         filename_ckpt = ("val_loss=" + str(round(loss, 3)) +
                              "_epoch=" + str(self.current_epoch) +
@@ -240,24 +245,25 @@ class Engine(LightningModule):
             # Create dummy input with appropriate shape
             dummy_input = torch.randn(1, self.seq_size, self.num_features, device=self.device)
             
-            # Export to ONNX
-            try:
-                torch.onnx.export(
-                    self.model,                  # model being run
-                    dummy_input,                 # model input (or a tuple for multiple inputs)
-                    onnx_path,                   # where to save the model
-                    export_params=True,          # store the trained parameter weights inside the model file
-                    opset_version=12,            # the ONNX version to export the model to
-                    do_constant_folding=True,    # whether to execute constant folding for optimization
-                    input_names=['input'],       # the model's input names
-                    output_names=['output'],     # the model's output names
-                    dynamic_axes={               # variable length axes
-                        'input': {0: 'batch_size'},
-                        'output': {0: 'batch_size'}
-                    }
-                )
-            except Exception as e:
-                print(f"Failed to export ONNX model: {e}")
+            # Export to ONNX (first process only when several GPUs are used)
+            if self.trainer.is_global_zero:
+                try:
+                    torch.onnx.export(
+                        self.model,                  # model being run
+                        dummy_input,                 # model input (or a tuple for multiple inputs)
+                        onnx_path,                   # where to save the model
+                        export_params=True,          # store the trained parameter weights inside the model file
+                        opset_version=12,            # the ONNX version to export the model to
+                        do_constant_folding=True,    # whether to execute constant folding for optimization
+                        input_names=['input'],       # the model's input names
+                        output_names=['output'],     # the model's output names
+                        dynamic_axes={               # variable length axes
+                            'input': {0: 'batch_size'},
+                            'output': {0: 'batch_size'}
+                        }
+                    )
+                except Exception as e:
+                    print(f"Failed to export ONNX model: {e}")
         
         self.last_path_ckpt = path_ckpt  
         
