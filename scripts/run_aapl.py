@@ -30,6 +30,7 @@ N_DAYS = 24                       # trading days expected in that folder
 HORIZONS = [10, 20, 50, 100]      # one TLOB run per horizon; the first one preprocesses
 GPUS = [0, 1, 2, 3]               # GPU for each horizon, same order
 WANDB = True                      # log to wandb (needs `wandb login` once on this machine)
+REUSE_PREPROCESSED = True         # skip preprocessing if data/<STOCK>/{train,val,test}.npy are newer than the csv files
 
 # ============================================================================================
 
@@ -62,6 +63,8 @@ def tlob_run(horizon, preprocess):
     """What main.py does for one run, with the config built directly instead of by Hydra."""
     sys.path.insert(0, TLOB_DIR)
     os.chdir(TLOB_DIR)                       # TLOB uses paths relative to its folder ("data/...")
+    import warnings
+    warnings.filterwarnings("ignore")        # main.py: same as its first lines
     import random
     import numpy as np
     import torch
@@ -158,6 +161,15 @@ def check_data():
     say(f"data: {DATA} ({N_DAYS} days)")
 
 
+def preprocessed_exists():
+    """data/<STOCK>/{train,val,test}.npy exist and are newer than every LOBSTER csv file."""
+    npys = [os.path.join(TLOB_DIR, "data", STOCK, f"{s}.npy") for s in ("train", "val", "test")]
+    if not all(os.path.isfile(f) for f in npys):
+        return False
+    newest_csv = max(os.path.getmtime(os.path.join(DATA, f)) for f in os.listdir(DATA))
+    return min(os.path.getmtime(f) for f in npys) > newest_csv
+
+
 def start_run(horizon, gpu, preprocess):
     log_path = os.path.join(LOG_DIR, f"{STOCK}_h{horizon}.log")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1")   # one GPU per run
@@ -185,8 +197,14 @@ def main():
     check_data()
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # first horizon: TLOB preprocesses, then trains
     runs = {}
+    if REUSE_PREPROCESSED and preprocessed_exists():
+        say(f"reusing preprocessed data/{STOCK}/{{train,val,test}}.npy (set REUSE_PREPROCESSED = False to redo)")
+        for horizon, gpu in zip(HORIZONS, GPUS):
+            runs[horizon] = start_run(horizon, gpu, preprocess=False)
+        return finish(runs)
+
+    # first horizon: TLOB preprocesses, then trains
     proc, log_path = start_run(HORIZONS[0], GPUS[0], preprocess=True)
     runs[HORIZONS[0]] = (proc, log_path)
     say("preprocessing (this takes a while) ...")
@@ -204,13 +222,18 @@ def main():
     # other horizons reuse data/<STOCK>/{train,val,test}.npy
     for horizon, gpu in zip(HORIZONS[1:], GPUS[1:]):
         runs[horizon] = start_run(horizon, gpu, preprocess=False)
+    finish(runs)
 
+
+def finish(runs):
     failed = []
     for horizon, (proc, log_path) in runs.items():
         if proc.wait() == 0:
             say(f"horizon {horizon} finished")
         else:
             say(f"horizon {horizon} FAILED (exit {proc.returncode}), see {log_path}")
+            with open(log_path, errors="replace") as f:
+                print("\n".join(f.read().replace("\r", "\n").splitlines()[-15:]), flush=True)
             failed.append(horizon)
 
     print(f"\nTest results, {STOCK}, test days = last 3 days up to {LAST_DAY}:")
