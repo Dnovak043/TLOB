@@ -65,6 +65,12 @@ def tlob_run(horizon, preprocess):
     os.chdir(TLOB_DIR)                       # TLOB uses paths relative to its folder ("data/...")
     import warnings
     warnings.filterwarnings("ignore")        # main.py: same as its first lines
+    import multiprocessing
+    if "fork" in multiprocessing.get_all_start_methods():
+        # DataLoader workers forked (the Linux default up to Python 3.13), not started by forkserver
+        # (Python 3.14's default): forkserver workers re-import TLOB's modules and hit the circular
+        # import between constants.py and preprocessing/dataset.py
+        multiprocessing.set_start_method("fork", force=True)
     import random
     import numpy as np
     import torch
