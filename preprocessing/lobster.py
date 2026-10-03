@@ -9,16 +9,8 @@ from torch.utils import data
 
 def lobster_load(path, all_features, len_smooth, h, seq_size):
     set = np.load(path)
-    if h == 10:
-        tmp = 5
-    if h == 20:
-        tmp = 4
-    elif h == 50:
-        tmp = 3
-    elif h == 100:
-        tmp = 2
-    elif h == 200:
-        tmp = 1
+    # the labels are the last len(cst.LOBSTER_HORIZONS) columns, one per horizon in that order
+    tmp = len(cst.LOBSTER_HORIZONS) - cst.LOBSTER_HORIZONS.index(h)
     labels = set[seq_size-len_smooth:, -tmp]
     labels = labels[np.isfinite(labels)]
     labels = torch.from_numpy(labels).long()
