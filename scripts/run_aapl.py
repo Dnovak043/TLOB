@@ -178,7 +178,10 @@ def preprocessed_exists():
 
 def start_run(horizon, gpu, preprocess):
     log_path = os.path.join(LOG_DIR, f"{STOCK}_h{horizon}.log")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1")   # one GPU per run
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1",   # one GPU per run
+               # torch >= 2.6 loads checkpoints with weights_only=True by default, which can refuse TLOB's
+               # checkpoints; run.py then silently tests the last epoch instead of the best one
+               TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1")
     proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--run", str(horizon), str(int(preprocess))],
                             cwd=TLOB_DIR, env=env, stdout=open(log_path, "w"), stderr=subprocess.STDOUT)
     say(f"horizon {horizon} started on GPU {gpu} -> {log_path}")
@@ -186,11 +189,11 @@ def start_run(horizon, gpu, preprocess):
 
 
 def last_value(log_path, name):
-    """Last value of a Lightning test metric line such as '  f1_score   0.42'."""
+    """Last value of a Lightning test metric line such as '  f1_score   0.42' or '│ f1_score │ 0.42 │'."""
     value = None
     with open(log_path, errors="replace") as f:
         for line in f.read().replace("\r", "\n").splitlines():
-            m = re.match(rf"\s*{name}\s+([0-9.]+)\s*$", line)
+            m = re.search(rf"\b{name}\b[\s│|]+([0-9]+\.[0-9]+)", line)
             if m:
                 value = m.group(1)
     return value
