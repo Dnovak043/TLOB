@@ -127,7 +127,13 @@ def check_environment():
         if "HfFolder" in str(e):
             fail(f"{e}. Fix:\n  {sys.executable} -m pip install 'transformers<4.47' 'huggingface_hub<1.0'")
         raise
-    say(f"python {sys.version.split()[0]} | torch {torch.__version__} | GPUs visible: {torch.cuda.device_count()}")
+    import pandas
+    if int(pandas.__version__.split(".")[0]) >= 3:
+        # TLOB divides integer price columns in place (orderbook.loc[:, ::2] /= 10000), which pandas 3 rejects
+        fail(f"pandas {pandas.__version__} is too new for TLOB's preprocessing. Fix:\n"
+             f"  {sys.executable} -m pip install 'pandas>=2.2,<3'")
+    say(f"python {sys.version.split()[0]} | torch {torch.__version__} | pandas {pandas.__version__} | "
+        f"GPUs visible: {torch.cuda.device_count()}")
     if torch.cuda.device_count() < len(GPUS):
         fail(f"{len(GPUS)} GPUs needed ({GPUS}), {torch.cuda.device_count()} visible")
     if WANDB:
